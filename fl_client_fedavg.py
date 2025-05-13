@@ -214,33 +214,23 @@ class FederatedClient:
     def train_local_model(self, current_round):
         """Train the model on local data"""
         logger.info(f"Starting local training for {self.local_epochs} epochs")
-        # Initialize optimizer and learning rate scheduler
         optimizer = self.setup_optimizer()
         scheduler = self.setup_scheduler(optimizer)
         
-        # EMA model for evaluation
-        ema = util.EMA(self.model)
-        
-        # Loss function
+        ema = util.EMA(self.model)    
         criterion = util.ComputeLoss(self.model, self.params)
         
-        # Setup AMP scaler for mixed precision training
-        amp_scale = torch.amp.GradScaler()
-        
-        # Track metrics
         metrics = {
             'train_loss': [],
             'val_map50': [],
             'val_map': []
         }
         
-        # Start training
         best_map = 0
         for epoch in range(self.local_epochs):
             self.model.train()
             epoch_loss = util.AverageMeter()
             
-            # Progress bar for training
             p_bar = tqdm.tqdm(enumerate(self.train_loader), total=len(self.train_loader))
             p_bar.set_description(f"Round {current_round}, Epoch {epoch+1}/{self.local_epochs}")
             
@@ -248,59 +238,39 @@ class FederatedClient:
                 samples = samples.to(self.device).float() / 255
                 targets = targets.to(self.device)
                 
-                # Forward pass with mixed precision
-                with torch.cuda.amp.autocast():
-                    outputs = self.model(samples)
-                    loss = criterion(outputs, targets)
+                outputs = self.model(samples)
+                loss = criterion(outputs, targets)
                 
-                # Update loss tracking
                 epoch_loss.update(loss.item(), samples.size(0))
                 
-                # Backward pass with gradient scaling
                 optimizer.zero_grad()
-                amp_scale.scale(loss).backward()
-                amp_scale.unscale_(optimizer)
+                loss.backward()
                 util.clip_gradients(self.model)
-                amp_scale.step(optimizer)
-                amp_scale.update()
+                optimizer.step()
                 
-                # Update EMA model
                 ema.update(self.model)
-                
-                # Update progress bar
                 p_bar.set_postfix({'loss': f'{epoch_loss.avg:.4f}'})
             
-            # Step scheduler
             scheduler.step()
-            
-            # Save average epoch loss
             metrics['train_loss'].append(epoch_loss.avg)
             
-            # Evaluate model
             if (epoch + 1) % self.args.eval_interval == 0 or epoch == self.local_epochs - 1:
                 map50, mean_ap = self.evaluate_model(ema.ema)
                 metrics['val_map50'].append(map50)
                 metrics['val_map'].append(mean_ap)
                 
-                # Save best model
                 if mean_ap > best_map:
                     best_map = mean_ap
                     self.save_model(ema.ema, current_round, epoch, is_best=True)
                 
                 logger.info(f"Epoch {epoch+1}/{self.local_epochs}, Loss: {epoch_loss.avg:.4f}, "
                         f"mAP50: {map50:.4f}, mAP: {mean_ap:.4f}")
-            
-            # Save checkpoint
             if (epoch + 1) % self.args.save_interval == 0:
                 self.save_model(ema.ema, current_round, epoch)
         
-        # Get the dataset size
         dataset_size = len(self.train_dataset)
-        
-        # Return the EMA model, metrics, and dataset size
         return ema.ema.state_dict(), metrics, dataset_size
-
-    
+        
     def setup_optimizer(self):
         """Setup model optimizer"""
         # Split parameters into groups for different weight decays
