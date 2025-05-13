@@ -193,7 +193,7 @@ class Dataset(data.Dataset):
         x = {}
         for filename in filenames:
             try:
-                print(filename)
+                # print(filename)
                 # verify images
                 with open(filename, 'rb') as f:
                     image = Image.open(f)
