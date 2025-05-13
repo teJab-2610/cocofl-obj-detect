@@ -234,12 +234,10 @@ class FederatedClient:
         
         optimizer = self.setup_optimizer()
         scheduler = self.setup_scheduler(optimizer)
-        
         ema = util.EMA(self.model)
         
         criterion = util.ComputeLoss(self.model, self.params)
-        amp_scale = torch.cuda.amp.GradScaler()
-    
+        
         metrics = {
             'train_loss': [],
             'val_map50': [],
@@ -257,24 +255,22 @@ class FederatedClient:
             for i, (samples, targets, _) in p_bar:
                 samples = samples.to(self.device).float() / 255
                 targets = targets.to(self.device)
-    
-                with torch.cuda.amp.autocast():
-                    outputs = self.model(samples)
-                    loss = criterion(outputs, targets)
+                
+                outputs = self.model(samples)
+                loss = criterion(outputs, targets)
                 
                 epoch_loss.update(loss.item(), samples.size(0))
-    
+                
                 optimizer.zero_grad()
-                amp_scale.scale(loss).backward()
-                amp_scale.unscale_(optimizer)
+                loss.backward()
                 util.clip_gradients(self.model)
-                amp_scale.step(optimizer)
-                amp_scale.update()
-    
-                ema.update(self.model)
+                optimizer.step()
+                
+                ema.update(self.model)        
                 p_bar.set_postfix({'loss': f'{epoch_loss.avg:.4f}'})
             
             scheduler.step()
+            
             metrics['train_loss'].append(epoch_loss.avg)
             
             if (epoch + 1) % self.args.eval_interval == 0 or epoch == self.local_epochs - 1:
@@ -291,10 +287,11 @@ class FederatedClient:
             
             if (epoch + 1) % self.args.save_interval == 0:
                 self.save_model(ema.ema, current_round, epoch)
+        
         dataset_size = len(self.train_dataset)
         
         return ema.ema.state_dict(), metrics, dataset_size, self.trainable_blocks
-    
+
     def setup_optimizer(self):
         """Setup model optimizer for trainable parameters only"""
         p = [], [], []
