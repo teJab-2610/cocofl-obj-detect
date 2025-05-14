@@ -18,6 +18,7 @@ from nets import nn
 from utils import util
 from utils.dataset import Dataset
 
+# Configure logging
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -40,12 +41,18 @@ class FederatedClient:
         self.client_id = args.client_id or str(uuid.uuid4())[:8]
         self.local_epochs = args.local_epochs
         
+        # Set device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         self.trainable_blocks = args.trainable_blocks if hasattr(args, 'trainable_blocks') else []
 
+        # Initialize model (will be replaced with server model)
         self.init_model()
         
+        # Load datasets
         self.load_datasets()
+        
+        # Create directory for saving local results
         os.makedirs(args.save_dir, exist_ok=True)
         
         logger.info(f"Client {self.client_id} initialized")
@@ -55,9 +62,11 @@ class FederatedClient:
 
     def set_trainable_parameters(self):
         """Set which parameters should be trainable based on configuration"""
+        # Set requires_grad=False for all parameters by default
         for param in self.model.parameters():
             param.requires_grad = False
         
+        # Set trainable blocks based on configuration
         if 1 in self.trainable_blocks:  # net (backbone)
             logger.info(f"Setting backbone (net) parameters as trainable")
             for param in self.model.net.parameters():
@@ -73,6 +82,7 @@ class FederatedClient:
             for param in self.model.head.parameters():
                 param.requires_grad = True
         
+        # Log parameter statistics
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         logger.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params} ({trainable_params/total_params*100:.2f}%)")
@@ -110,6 +120,7 @@ class FederatedClient:
     
     def load_datasets(self):
         """Load training and validation datasets"""
+        # Load training filenames
         train_filenames = []
         with open(self.args.train_file) as reader:
             for filename in reader.readlines():
@@ -123,6 +134,7 @@ class FederatedClient:
         
         logger.info(f"Loaded {len(train_filenames)} training images")
         
+        # Load validation filenames
         val_filenames = []
         with open(self.args.val_file) as reader:
             for filename in reader.readlines():
@@ -136,6 +148,7 @@ class FederatedClient:
         
         logger.info(f"Loaded {len(val_filenames)} validation images")
         
+        # Create training dataset and loader
         self.train_dataset = Dataset(train_filenames, self.args.input_size, self.params, True)
         self.train_loader = data.DataLoader(
             self.train_dataset, 
@@ -145,6 +158,7 @@ class FederatedClient:
             pin_memory=True, 
             collate_fn=Dataset.collate_fn
         )
+        # Create validation dataset and loader
         self.val_dataset = Dataset(val_filenames, self.args.input_size, self.params, False)
         self.val_loader = data.DataLoader(
             self.val_dataset, 
@@ -192,8 +206,10 @@ class FederatedClient:
             sock.connect((self.server_address, self.server_port))
             logger.info(f"Connected to server at {self.server_address}:{self.server_port}")
             
+            # Send client ID
             self.send_data(sock, pickle.dumps(self.client_id))
             
+            # Receive round number and trainable blocks from server
             server_data = self.receive_data(sock)
             if not server_data:
                 logger.error("Failed to receive data from server")
@@ -203,13 +219,16 @@ class FederatedClient:
             current_round, server_trainable_blocks = pickle.loads(server_data)
             logger.info(f"Server says we're on round: {current_round}")
             
+            # Update trainable blocks configuration from server if provided
             if server_trainable_blocks:
                 self.trainable_blocks = server_trainable_blocks
                 logger.info(f"Server assigned trainable blocks: {self.trainable_blocks}")
             
+            # Handle special round numbers that indicate client should wait/retry
             if current_round in (-1, -2):
                 return sock, current_round, self.trainable_blocks
             
+            # Receive global model
             server_data = self.receive_data(sock)
             if not server_data:
                 logger.error("Failed to receive global model from server")
@@ -217,9 +236,11 @@ class FederatedClient:
                 return None, 0, []
                 
             global_model_state = pickle.loads(server_data)
+            # Load global model parameters
             self.model.load_state_dict(global_model_state)
             logger.info("Global model received and loaded")
             
+            # Set trainable parameters based on configuration
             self.set_trainable_parameters()
             
             return sock, current_round, self.trainable_blocks
@@ -228,27 +249,124 @@ class FederatedClient:
             logger.error(f"Error connecting to server: {e}")
             return None, 0, []
 
+    # def train_local_model(self, current_round):
+    #     """Train the model on local data"""
+    #     logger.info(f"Starting local training for {self.local_epochs} epochs with trainable blocks: {self.trainable_blocks}")
+        
+    #     # Initialize optimizer only for trainable parameters
+    #     optimizer = self.setup_optimizer()
+    #     scheduler = self.setup_scheduler(optimizer)
+        
+    #     # EMA model for evaluation
+    #     ema = util.EMA(self.model)
+        
+    #     # Loss function
+    #     criterion = util.ComputeLoss(self.model, self.params)
+        
+    #     # Setup AMP scaler for mixed precision training
+    #     amp_scale = torch.cuda.amp.GradScaler()
+        
+    #     # Track metrics
+    #     metrics = {
+    #         'train_loss': [],
+    #         'val_map50': [],
+    #         'val_map': []
+    #     }
+        
+    #     # Start training
+    #     best_map = 0
+    #     for epoch in range(self.local_epochs):
+    #         self.model.train()
+    #         epoch_loss = util.AverageMeter()
+            
+    #         # Progress bar for training
+    #         p_bar = tqdm.tqdm(enumerate(self.train_loader), total=len(self.train_loader))
+    #         p_bar.set_description(f"Round {current_round}, Epoch {epoch+1}/{self.local_epochs}")
+            
+    #         for i, (samples, targets, _) in p_bar:
+    #             samples = samples.to(self.device).float() / 255
+    #             targets = targets.to(self.device)
+                
+    #             # Forward pass with mixed precision
+    #             with torch.cuda.amp.autocast():
+    #                 outputs = self.model(samples)
+    #                 loss = criterion(outputs, targets)
+                
+    #             # Update loss tracking
+    #             epoch_loss.update(loss.item(), samples.size(0))
+                
+    #             # Backward pass with gradient scaling
+    #             optimizer.zero_grad()
+    #             amp_scale.scale(loss).backward()
+    #             amp_scale.unscale_(optimizer)
+    #             util.clip_gradients(self.model)
+    #             amp_scale.step(optimizer)
+    #             amp_scale.update()
+                
+    #             # Update EMA model
+    #             ema.update(self.model)
+                
+    #             # Update progress bar
+    #             p_bar.set_postfix({'loss': f'{epoch_loss.avg:.4f}'})
+            
+    #         # Step scheduler
+    #         scheduler.step()
+            
+    #         # Save average epoch loss
+    #         metrics['train_loss'].append(epoch_loss.avg)
+            
+    #         # Evaluate model
+    #         if (epoch + 1) % self.args.eval_interval == 0 or epoch == self.local_epochs - 1:
+    #             map50, mean_ap = self.evaluate_model(ema.ema)
+    #             metrics['val_map50'].append(map50)
+    #             metrics['val_map'].append(mean_ap)
+                
+    #             # Save best model
+    #             if mean_ap > best_map:
+    #                 best_map = mean_ap
+    #                 self.save_model(ema.ema, current_round, epoch, is_best=True)
+                
+    #             logger.info(f"Epoch {epoch+1}/{self.local_epochs}, Loss: {epoch_loss.avg:.4f}, "
+    #                     f"mAP50: {map50:.4f}, mAP: {mean_ap:.4f}")
+            
+    #         # Save checkpoint
+    #         if (epoch + 1) % self.args.save_interval == 0:
+    #             self.save_model(ema.ema, current_round, epoch)
+        
+    #     # Get the dataset size
+    #     dataset_size = len(self.train_dataset)
+        
+    #     # Return the EMA model, metrics, dataset size, and trainable blocks info
+    #     return ema.ema.state_dict(), metrics, dataset_size, self.trainable_blocks
+    
     def train_local_model(self, current_round):
         """Train the model on local data"""
         logger.info(f"Starting local training for {self.local_epochs} epochs with trainable blocks: {self.trainable_blocks}")
         
+        # Initialize optimizer only for trainable parameters
         optimizer = self.setup_optimizer()
         scheduler = self.setup_scheduler(optimizer)
+        
+        # EMA model for evaluation
         ema = util.EMA(self.model)
         
+        # Loss function
         criterion = util.ComputeLoss(self.model, self.params)
         
+        # Track metrics
         metrics = {
             'train_loss': [],
             'val_map50': [],
             'val_map': []
         }
         
+        # Start training
         best_map = 0
         for epoch in range(self.local_epochs):
             self.model.train()
             epoch_loss = util.AverageMeter()
             
+            # Progress bar for training
             p_bar = tqdm.tqdm(enumerate(self.train_loader), total=len(self.train_loader))
             p_bar.set_description(f"Round {current_round}, Epoch {epoch+1}/{self.local_epochs}")
             
@@ -256,28 +374,38 @@ class FederatedClient:
                 samples = samples.to(self.device).float() / 255
                 targets = targets.to(self.device)
                 
+                # Standard forward pass without mixed precision
                 outputs = self.model(samples)
                 loss = criterion(outputs, targets)
                 
+                # Update loss tracking
                 epoch_loss.update(loss.item(), samples.size(0))
                 
+                # Standard backward pass
                 optimizer.zero_grad()
                 loss.backward()
                 util.clip_gradients(self.model)
                 optimizer.step()
                 
-                ema.update(self.model)        
+                # Update EMA model
+                ema.update(self.model)
+                
+                # Update progress bar
                 p_bar.set_postfix({'loss': f'{epoch_loss.avg:.4f}'})
             
+            # Step scheduler
             scheduler.step()
             
+            # Save average epoch loss
             metrics['train_loss'].append(epoch_loss.avg)
             
+            # Evaluate model
             if (epoch + 1) % self.args.eval_interval == 0 or epoch == self.local_epochs - 1:
                 map50, mean_ap = self.evaluate_model(ema.ema)
                 metrics['val_map50'].append(map50)
                 metrics['val_map'].append(mean_ap)
                 
+                # Save best model
                 if mean_ap > best_map:
                     best_map = mean_ap
                     self.save_model(ema.ema, current_round, epoch, is_best=True)
@@ -285,15 +413,19 @@ class FederatedClient:
                 logger.info(f"Epoch {epoch+1}/{self.local_epochs}, Loss: {epoch_loss.avg:.4f}, "
                         f"mAP50: {map50:.4f}, mAP: {mean_ap:.4f}")
             
+            # Save checkpoint
             if (epoch + 1) % self.args.save_interval == 0:
                 self.save_model(ema.ema, current_round, epoch)
         
+        # Get the dataset size
         dataset_size = len(self.train_dataset)
         
+        # Return the EMA model, metrics, dataset size, and trainable blocks info
         return ema.ema.state_dict(), metrics, dataset_size, self.trainable_blocks
-
+    
     def setup_optimizer(self):
         """Setup model optimizer for trainable parameters only"""
+        # Only include parameters that require gradient
         p = [], [], []
         for v in self.model.modules():
             if hasattr(v, 'bias') and isinstance(v.bias, torch.nn.Parameter) and v.bias.requires_grad:
@@ -303,25 +435,32 @@ class FederatedClient:
             elif hasattr(v, 'weight') and isinstance(v.weight, torch.nn.Parameter) and v.weight.requires_grad:
                 p[0].append(v.weight)
         
+        # Calculate weight decay adjustment based on batch size
         weight_decay = self.params['weight_decay'] * self.args.batch_size / 64
         
         # Create SGD optimizer with parameter groups
         optimizer = torch.optim.SGD(p[2], self.params['lr0'], self.params['momentum'], nesterov=True)
         
+        # Only add parameter groups if they have parameters
         if len(p[0]) > 0:
             optimizer.add_param_group({'params': p[0], 'weight_decay': weight_decay})
         if len(p[1]) > 0:
             optimizer.add_param_group({'params': p[1]})
             
+        # Log number of parameters in each group
         logger.info(f"Optimizer param groups: weights={sum(x.numel() for x in p[0])}, "
                    f"biases={sum(x.numel() for x in p[2])}, BN={sum(x.numel() for x in p[1])}")
         
         return optimizer
+
     
     def setup_scheduler(self, optimizer):
         """Setup learning rate scheduler"""
+        # Define linear decay function
         def lr_fn(x):
             return (1 - x / self.local_epochs) * (1.0 - self.params['lrf']) + self.params['lrf']
+        
+        # Create LambdaLR scheduler
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn, last_epoch=-1)
         
         return scheduler
@@ -330,9 +469,10 @@ class FederatedClient:
     def evaluate_model(self, model):
         """Evaluate the model on validation data"""
         model.eval()
-        model.half()  
-
-        iou_v = torch.linspace(0.5, 0.95, 10).to(self.device)  
+        model.half()  # Convert to half precision for evaluation
+        
+        # Configure
+        iou_v = torch.linspace(0.5, 0.95, 10).to(self.device)  # iou vector for mAP@0.5:0.95
         n_iou = iou_v.numel()
         
         metrics = []
@@ -343,8 +483,10 @@ class FederatedClient:
             samples = samples / 255  # 0 - 255 to 0.0 - 1.0
             _, _, height, width = samples.shape
             
+            # Inference
             outputs = model(samples)
             
+            # NMS
             targets[:, 2:] *= torch.tensor((width, height, width, height)).to(self.device)
             outputs = util.non_max_suppression(outputs, 0.001, 0.65)
             
@@ -389,11 +531,14 @@ class FederatedClient:
                     correct = torch.tensor(correct, dtype=torch.bool, device=iou_v.device)
                 metrics.append((correct, output[:, 4], output[:, 5], labels[:, 0]))
         
-        metrics = [torch.cat(x, 0).cpu().numpy() for x in zip(*metrics)]  
+        # Compute metrics
+        metrics = [torch.cat(x, 0).cpu().numpy() for x in zip(*metrics)]  # to numpy
+        
         map50, mean_ap = 0.0, 0.0
         if len(metrics) and metrics[0].any():
             tp, fp, precision, recall, map50, mean_ap = util.compute_ap(*metrics)
         
+        # Convert back to float for training
         model.float()
         
         return map50, mean_ap
@@ -424,21 +569,28 @@ class FederatedClient:
                                             current_round is the round number that was just completed
         """
         try:
+            # Connect to the server
             sock, current_round, trainable_blocks = self.connect_to_server()
             if sock is None:
                 logger.error("Failed to connect to server")
                 return False, 0
             
+            # Check if we got a special round number that indicates we should retry later
             if current_round in (-1, -2):
+                # Server is busy or we already participated in this round
                 reason = "Server is busy" if current_round == -1 else "Already participated in this round"
                 logger.info(f"{reason}. Will retry later.")
                 sock.close()
                 return False, 0
             
+            # Train the model on local data
             model_state, metrics, dataset_size, trainable_blocks = self.train_local_model(current_round)
+            
+            # Send the trained model back to the server along with dataset size and trainable blocks info
             self.send_data(sock, pickle.dumps((model_state, metrics, dataset_size, trainable_blocks)))
             logger.info(f"Trained model sent to server (dataset size: {dataset_size}, trainable blocks: {trainable_blocks})")
             
+            # Close connection
             sock.close()
             logger.info("Connection closed")
             
@@ -452,8 +604,9 @@ class FederatedClient:
 def main():
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #os.getlogin()
     parser = argparse.ArgumentParser(description="Federated Learning Client for YOLOv8")
-    parser.add_argument('--server-address', type=str, default='10.23.105.40',
+    parser.add_argument('--server-address', type=str, default='10.23.105.41',
                         help='Server address to connect to')
     parser.add_argument('--server-port', type=int, default=5000,
                         help='Server port to connect to')
@@ -471,9 +624,9 @@ def main():
     parser.add_argument('--model-size', type=str, default='n', 
                         choices=['n', 's', 'm', 'l', 'x', 'coco-n', 'coco-s', 'coco-m', 'coco-l', 'coco-x'],
                         help='YOLOv8 model size: n(ano), s(mall), m(edium), l(arge), x(large)')
-    parser.add_argument('--train-file', type=str, default='/home/ssl40/cs21b048_37_dl/datasets/kitti1/client_1/train.txt',
+    parser.add_argument('--train-file', type=str, default='/home/ssl41/cs21b048_37_dl/YOLOv8-pt/soda10m_distribution/iid/client1/train.txt',
                         help='Path to training image list')
-    parser.add_argument('--val-file', type=str, default='/home/ssl40/cs21b048_37_dl/datasets/kitti1/client_1/val.txt',
+    parser.add_argument('--val-file', type=str, default='/home/ssl41/cs21b048_37_dl/YOLOv8-pt/soda10m_distribution/iid/client1/val.txt',
                         help='Path to validation image list')
     parser.add_argument('--save-dir', type=str, default='',
                         help='Directory to save local models and metrics')
@@ -485,37 +638,40 @@ def main():
                         help='Interval between connection retries (seconds)')
     parser.add_argument('--max-retries', type=int, default=5,
                         help='Maximum number of connection retries')
-    parser.add_argument('--rounds', type=int, default=50,
+    parser.add_argument('--rounds', type=int, default=30,
                         help='Maximum number of rounds to participate in (default: 10)')
     parser.add_argument('--trainable-blocks', type=int, nargs='+', default=[1, 2, 3],
                         help='Blocks to train: 1=net, 2=fpn, 3=head (default: all blocks)')
     
     args = parser.parse_args()
     
-    with open(os.path.join('utils', 'args.yaml'), errors='ignore') as f:
+    # Load parameter configuration
+    with open(os.path.join('utils', 'args_soda.yaml'), errors='ignore') as f:
         params = yaml.safe_load(f)
     if args.save_dir == '':
-        args.save_dir = os.path.join('fl_client_results_final', f'freeze_kitti_client_2_{args.client_id}_{timestamp}')
+        args.save_dir = os.path.join('fl_client_results_final', f'freeze_soda_iid_client_{args.client_id}_{timestamp}')
     else:
         args.save_dir = os.path.join(args.save_dir, f'client_{args.client_id}_{timestamp}')
     os.makedirs(args.save_dir, exist_ok=True)
     logger.info(f"Results will be saved in {args.save_dir}")
     logger.info(f"Client ID: {args.client_id}")
-    with open(os.path.join(args.save_dir, 'args.yaml'), 'w') as f:
-        yaml.dump(vars(args), f, default_flow_style=False)
     logger.info(f"Arguments saved to {os.path.join(args.save_dir, 'args.yaml')}")
 
+    # Load parameter configuration
     with open(os.path.join('utils', 'args.yaml'), errors='ignore') as f:
         params = yaml.safe_load(f)
     
+    # Initialize client
     client = FederatedClient(args, params)
     
+    # Continue participating in rounds until maximum rounds reached
     current_round = 0
     max_rounds = args.rounds
     
     while current_round < max_rounds:
         logger.info(f"Attempting to participate in round {current_round+1}/{max_rounds}")
         
+        # Retry logic for connection
         retries = 0
         success = False
         
@@ -529,6 +685,7 @@ def main():
             if success:
                 current_round = new_round
                 logger.info(f"Successfully participated in round {current_round}")
+                # Small delay before attempting next round
                 time.sleep(5)
             else:
                 retries += 1
